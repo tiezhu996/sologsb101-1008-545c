@@ -32,7 +32,7 @@ docker compose up -d --build      # 改代码后重新构建启动
 | 框架 | Vue 3.5 | `<script setup>` + Composition API |
 | 语言 | TypeScript 5.7 | `strict` 严格模式，构建前执行 `vue-tsc --noEmit` |
 | UI 组件 | TDesign Vue Next 1.20 | 表格、表单、Dialog、Tag、Descriptions、Progress |
-| 状态管理 | Pinia 2.3 | `stationStore` / `valveStore` / `adjustStore` |
+| 状态管理 | Pinia 2.3 | `stationStore` / `valveStore` / `adjustStore` / `gridPlanStore` |
 | 路由 | Vue Router 4.5 | History 模式，nginx `try_files` 回退 |
 | 本地持久化 | Dexie 4（IndexedDB） | 版本号 + `upgrade` 迁移 + 幂等播种 |
 | 构建 | Vite 6 | 输出 `dist/`，按路由自动分包 |
@@ -53,13 +53,14 @@ sologsb101-1008/
     ├── package.json / tsconfig.json / vite.config.ts / index.html
     ├── public/favicon.svg
     └── src/
-        ├── types/              # station.ts building.ts valve.ts measure.ts adjust.ts
-        ├── stores/             # stationStore.ts valveStore.ts adjustStore.ts
+        ├── types/              # station.ts building.ts valve.ts measure.ts adjust.ts grid.ts
+        ├── stores/             # stationStore.ts valveStore.ts adjustStore.ts gridPlanStore.ts
         ├── components/common/  # BalanceTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
+        ├── components/grid/    # GridPlanDialog.vue（可中止调网方案）
         ├── hooks/              # useImbalanceRank.ts useIdbTable.ts
         ├── pages/              # StationList.vue ValveList.vue MeasureEntry.vue BalanceBoard.vue AdjustOrder.vue
         ├── router/index.ts
-        ├── utils/              # balance.ts db.ts export.ts
+        ├── utils/              # balance.ts baseline.ts db.ts export.ts
         ├── styles/main.css
         ├── App.vue
         └── main.ts
@@ -72,15 +73,22 @@ sologsb101-1008/
 | `/stations` | 换热站与楼栋台账 | Station、Building | 新建/编辑/删除换热站与楼栋；按供热方式与面积区间筛选；卡片回显失衡楼栋数与待复核单数 |
 | `/valves` | 阀位与设计参数登记 | Valve、Building | 登记口径/位置/开度/设计流量；开度改动进入草稿后可逐条或批量提交；失衡标签与开度校核 |
 | `/measures` | 实测流量/供回水温录入 | Measure、Valve | 按日期成组录入流量与三温；支持「阀门编号,日期,流量,供温,回温,室温,录入人」批量粘贴导入并即时预览失衡度 |
-| `/balance` | 失衡度计算与排序 | Valve、Measure | 按失衡度降序排行；仅看失衡；导出失衡度 CSV；单条/一键生成调节单 |
-| `/adjusts` | 调节单下发与复核 | Adjust、Valve、Measure | 状态机 待下发→已调节（回写阀门开度）→已复核（记录复核意见）；导出调节单 CSV 与全量 JSON |
+| `/balance` | 失衡度计算与排序 | Valve、Measure、Adjust、GridPlan | 按失衡度降序排行；仅看失衡；导出失衡度 CSV；单条/一键生成调节单（生成即冻结依据基线）；**发起「可中止的调网方案」**：选站冻结该站阀门开度、最新实测与目标开度，逐张执行回填实际开度与新实测 |
+| `/adjusts` | 调节单下发与复核 | Adjust、Valve、Measure | 状态机 待下发→已调节（回写阀门开度）→已复核（记录复核意见）；调节单展示冻结依据基线（旧单首次打开补录并标记）；导出调节单 CSV 与全量 JSON |
 
 ## 五、数据存储说明
 
 - **IndexedDB 库名**：`gbheatgrid`（Dexie 封装，`src/utils/db.ts`）
-- **对象表**：`stations`、`buildings`、`valves`、`measures`、`adjusts`
-- **数据结构版本**：`DB_VERSION = 2`，含 `version(1)` → `version(2)` 的索引变更与 `upgrade()` 迁移（补齐 `revision`、用所属楼栋回填阀门 `stationId` 冗余列、规整开度与复核字段）
-- **首屏自动播种**：`initDatabase()` 中 `if (await db.stations.count() === 0) await seedDatabase()`，播种 2 座换热站 → 5 栋楼 → 10 只阀门 → 20 条实测 → 4 张调节单的互相引用数据；播种幂等
+- **对象表**：`stations`、`buildings`、`valves`、`measures`、`adjusts`、`gridplans`
+- **数据结构版本**：`DB_VERSION = 3`，含 `version(1) → version(2) → version(3)` 的索引变更与 `upgrade()` 迁移：
+  - v2：补齐 `revision`、用所属楼栋回填阀门 `stationId` 冗余列、规整开度与复核字段
+  - v3：新增 `gridplans` 调网方案表；为旧调节单补出依据基线 `AdjustBaseline`（标记 `backfilled`，原 `basis` 依据原文保留）
+- **调网方案（gridplans）语义**：
+  - 选站后冻结每只阀门的台账开度、最新实测（流量/室温/日期）与目标开度，方案进行中建议依据始终指向这组数据
+  - 执行时逐张回填实际开度与新实测（写入 `measures`），已确认项锁定不重算；方案可随时中止，未执行项置「已跳过」
+  - 执行瞬间若阀门台账开度已被阀位登记页同时编辑且与现场回填值不一致，保留台账/调节**两方来源**（`conflict.ledger` / `conflict.adjust`），任一边都不覆盖另一边，须人工确认采用值
+  - 保存失败时业务表不产生半写；重新打开方案自动恢复并定位到最后确认之后的第一张未完成单
+- **首屏自动播种**：`initDatabase()` 中 `if (await db.stations.count() === 0) await seedDatabase()`，播种 2 座换热站 → 5 栋楼 → 10 只阀门 → 20 条实测 → 4 张调节单（含补录基线）的互相引用数据；播种幂等
 - **localStorage 辅助键**：`gbheatgrid:db-version`、`gbheatgrid:last-backup-at`、`gbheatgrid:ui-prefs`（上次选中换热站、仅看失衡开关）
 - 应用为**无状态容器**：数据不落容器磁盘、不使用数据库服务、不挂载命名卷
 

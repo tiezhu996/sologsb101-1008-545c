@@ -1,22 +1,26 @@
 <script setup lang="ts">
 /**
  * /balance 失衡度计算与排序
- * 按流量比、室温偏差合成失衡度并降序排列，可一键生成调节单。
- * 消费 Valve、Measure；复用 <BalanceTag>、<StatBadge>、<EmptyPanel>。
+ * 按流量比、室温偏差合成失衡度并降序排列，可一键生成调节单；
+ * 支持按换热站发起「可中止的调网方案」：冻结依据 → 逐张执行回填 → 冲突双源待确认 → 失败可恢复。
+ * 消费 Valve、Measure、Adjust、GridPlan；复用 <BalanceTag>、<StatBadge>、<EmptyPanel>。
  */
-import { computed, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { DialogPlugin, MessagePlugin } from 'tdesign-vue-next'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import BalanceTag from '@/components/common/BalanceTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
+import GridPlanDialog from '@/components/grid/GridPlanDialog.vue'
 import { useImbalanceRank, type ImbalanceRow } from '@/hooks/useImbalanceRank'
 import { useValveStore } from '@/stores/valveStore'
 import { useStationStore } from '@/stores/stationStore'
 import { useAdjustStore } from '@/stores/adjustStore'
+import { useGridPlanStore } from '@/stores/gridPlanStore'
 import { IMBALANCE_BALANCED, IMBALANCE_WARN, basisText, formatFlow, formatOpening } from '@/utils/balance'
-import { ADJUST_STATES, EMPTY_ADJUST_DRAFT, type AdjustDraft } from '@/types/adjust'
+import { freezeBaseline } from '@/utils/baseline'
+import { ADJUST_STATES, EMPTY_ADJUST_DRAFT, type AdjustBaseline, type AdjustDraft } from '@/types/adjust'
 import { exportBalanceCsv } from '@/utils/export'
 import { HEAT_MODES, type HeatMode } from '@/types/building'
 
@@ -27,6 +31,34 @@ const rank = useImbalanceRank()
 const valveStore = useValveStore()
 const stationStore = useStationStore()
 const adjustStore = useAdjustStore()
+const gridStore = useGridPlanStore()
+
+/** 旧调节单首次打开时补出依据基线（原依据保留不动），数据订阅就绪后执行一次 */
+let baselineBackfilled = false
+function runBaselineBackfill(): void {
+  if (baselineBackfilled || !rank.measureTable.ready.value) return
+  baselineBackfilled = true
+  void adjustStore
+    .backfillBaselines(
+      valveStore.valves.map((valve) => ({
+        id: valve.id,
+        currentOpening: valve.currentOpening,
+        designFlowM3h: valve.designFlowM3h
+      })),
+      rank.measureTable.rows.value.map((measure) => ({
+        valveId: measure.valveId,
+        date: measure.date,
+        flowM3h: measure.flowM3h,
+        roomTempC: measure.roomTempC
+      }))
+    )
+    .then((count) => {
+      if (count > 0) MessagePlugin.info(`已为 ${count} 张旧调节单补出依据基线，原依据仍可查看`)
+    })
+}
+
+onMounted(runBaselineBackfill)
+watch(() => rank.measureTable.ready.value, runBaselineBackfill)
 
 const filterModel = computed<FilterModel>(() => ({
   keyword: valveStore.filter.keyword,
@@ -94,21 +126,26 @@ async function generateOne(row: ImbalanceRow): Promise<void> {
     MessagePlugin.info(`${row.valve.code} 已存在调节单，请到调节单页处理`)
     return
   }
-  await adjustStore.createAdjust({
-    valveId: row.valve.id,
-    targetOpening: row.suggestOpening,
-    basis: describe(row),
-    executor: '待指派',
-    state: '待下发',
-    reviewNote: ''
-  })
-  MessagePlugin.success(`已为 ${row.valve.code} 生成调节单，目标开度 ${row.suggestOpening}%`)
+  await adjustStore.createAdjust(
+    {
+      valveId: row.valve.id,
+      targetOpening: row.suggestOpening,
+      basis: describe(row),
+      executor: '待指派',
+      state: '待下发',
+      reviewNote: ''
+    },
+    freezeBaseline(row)
+  )
+  MessagePlugin.success(`已为 ${row.valve.code} 生成调节单，目标开度 ${row.suggestOpening}%（依据已冻结）`)
 }
 
 /* --------------------------- 调节单维护 --------------------------- */
 
 const adjustDialogVisible = ref(false)
 const adjustForm = reactive<AdjustDraft>({ ...EMPTY_ADJUST_DRAFT })
+/** 维护弹窗中展示的冻结基线（旧单首次打开时若为补录会显式标记） */
+const editingBaseline = ref<AdjustBaseline | null>(null)
 
 function openAdjustEdit(row: ImbalanceRow): void {
   const adjust = adjustStore.adjusts.find((item) => item.valveId === row.valve.id)
@@ -124,12 +161,14 @@ function openAdjustEdit(row: ImbalanceRow): void {
     state: adjust.state,
     reviewNote: adjust.reviewNote
   })
+  editingBaseline.value = adjust.baseline ?? freezeBaseline(row)
   adjustDialogVisible.value = true
 }
 
 async function submitAdjust(): Promise<void> {
   const adjust = adjustStore.adjusts.find((item) => item.valveId === adjustForm.valveId)
   if (!adjust) return
+  // 基线冻结后不随读数/编辑重算；原依据 basis 仍可手工编辑查看
   await adjustStore.updateAdjust(adjust.id, { ...adjustForm })
   MessagePlugin.success('调节单已更新')
   adjustDialogVisible.value = false
@@ -161,14 +200,23 @@ async function generateAll(): Promise<void> {
       imbalanceValue: row.imbalanceValue,
       level: row.level,
       suggestOpening: row.suggestOpening,
-      basisText: describe(row)
+      basisText: describe(row),
+      baseline: freezeBaseline(row)
     }))
   const count = await adjustStore.generateFromRank(payload)
   if (count === 0) {
     MessagePlugin.info('没有新的失衡阀门需要生成调节单')
     return
   }
-  MessagePlugin.success(`已批量生成 ${count} 张调节单`)
+  MessagePlugin.success(`已批量生成 ${count} 张调节单（依据已冻结）`)
+}
+
+/* ----------------------------- 调网方案 ----------------------------- */
+
+const gridDialogVisible = ref(false)
+
+function openGridPlan(): void {
+  gridDialogVisible.value = true
 }
 
 function exportCsv(): void {
@@ -210,8 +258,26 @@ function goAdjust(): void {
       <div class="page-head__actions">
         <t-button variant="outline" @click="exportCsv">导出失衡度 CSV</t-button>
         <t-button variant="outline" @click="generateAll">一键生成调节单</t-button>
+        <t-button theme="warning" @click="openGridPlan">
+          {{ gridStore.hasActivePlan ? `继续调网方案（${gridStore.progress.confirmed}/${gridStore.progress.total}）` : '调网方案（可中止）' }}
+        </t-button>
         <t-button theme="primary" @click="goAdjust">前往调节单（{{ adjustStore.stateCounts['待下发'] }}）</t-button>
       </div>
+    </div>
+
+    <div v-if="gridStore.activePlan" class="active-plan-bar" @click="openGridPlan">
+      <t-tag size="small" theme="primary">{{ gridStore.activePlan.state }}</t-tag>
+      <span>
+        {{ gridStore.activePlan.stationName }} 调网方案：已确认 {{ gridStore.progress.confirmed }} /
+        {{ gridStore.progress.total }}
+        <template v-if="gridStore.progress.conflict > 0">
+          ，<strong>{{ gridStore.progress.conflict }} 张开度冲突待确认</strong>
+        </template>
+        <template v-if="gridStore.activePlan.lastError">
+          ，<strong>上次保存失败，点击重新打开恢复</strong>
+        </template>
+      </span>
+      <span class="muted">点击继续，从最后确认的一张单接着执行</span>
     </div>
 
     <div class="stat-row">
@@ -322,11 +388,24 @@ function goAdjust(): void {
       :cancel-btn="'取消'"
       @confirm="submitAdjust"
     >
-      <t-form :data="adjustForm" label-width="128px">
+      <div v-if="editingBaseline" class="baseline-box">
+        <div class="baseline-box__head">
+          <strong>依据基线（冻结）</strong>
+          <t-tag v-if="editingBaseline.backfilled" size="small" theme="warning">旧单首次打开补录</t-tag>
+        </div>
+        <div class="muted">
+          台账开度 {{ formatOpening(editingBaseline.opening) }} → 目标 {{ formatOpening(editingBaseline.targetOpening) }}
+          ；最新实测
+          {{ editingBaseline.measuredFlowM3h !== null ? `${editingBaseline.measuredFlowM3h.toFixed(1)} m³/h（${editingBaseline.measureDate}）` : '无' }}
+          ；失衡度
+          {{ editingBaseline.imbalanceValue !== null ? `${editingBaseline.imbalanceValue.toFixed(1)}%` : '—' }}
+        </div>
+      </div>
+      <t-form :data="adjustForm" label-width="128px" style="margin-top: 12px">
         <t-form-item label="目标开度(%)">
           <t-input-number v-model="adjustForm.targetOpening" :min="0" :max="100" :step="5" style="width: 100%" />
         </t-form-item>
-        <t-form-item label="调节依据">
+        <t-form-item label="调节依据（原依据）">
           <t-textarea v-model="adjustForm.basis" :autosize="{ minRows: 3, maxRows: 5 }" />
         </t-form-item>
         <t-form-item label="执行人">
@@ -340,5 +419,39 @@ function goAdjust(): void {
         </t-form-item>
       </t-form>
     </t-dialog>
+
+    <GridPlanDialog v-model:visible="gridDialogVisible" :rank-rows="rank.rows.value" />
   </div>
 </template>
+
+<style scoped>
+.active-plan-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+  padding: 10px 14px;
+  border: 1px solid #9bbde0;
+  border-radius: 10px;
+  background: #e8f1fb;
+  color: #234a75;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.baseline-box {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #e8f1fb;
+  border: 1px solid #9bbde0;
+}
+
+.baseline-box__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  color: #234a75;
+}
+</style>

@@ -13,6 +13,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useValveStore, type ValveEnriched } from '@/stores/valveStore'
 import { useStationStore } from '@/stores/stationStore'
 import { useImbalanceRank } from '@/hooks/useImbalanceRank'
+import { useGridPlanStore } from '@/stores/gridPlanStore'
 import {
   EMPTY_VALVE_DRAFT,
   VALVE_POSITIONS,
@@ -27,6 +28,13 @@ type FilterModel = { keyword: string; [key: string]: string | string[] | boolean
 const valveStore = useValveStore()
 const stationStore = useStationStore()
 const rank = useImbalanceRank()
+const gridStore = useGridPlanStore()
+
+/** 阀门是否被进行中的调网方案冻结（此时改开度将在执行时形成台账/调节双源冲突） */
+function frozenByActivePlan(valveId: string): boolean {
+  const plan = gridStore.activePlan
+  return !!plan && plan.items.some((item) => item.valveId === valveId && item.state !== '已确认' && item.state !== '已跳过')
+}
 
 /* ------------------------------ 筛选 ------------------------------ */
 
@@ -278,6 +286,9 @@ async function commitOne(row: ValveEnriched): Promise<void> {
               保存
             </t-button>
           </div>
+          <t-tag v-if="frozenByActivePlan(row.valve.id)" size="small" theme="danger" style="margin-top: 4px">
+            调网已冻结，改动将形成冲突待确认
+          </t-tag>
         </template>
         <template #balanceCell="{ row }">
           <BalanceTag

@@ -15,13 +15,18 @@ import {
 import { useValveStore } from '@/stores/valveStore'
 import { balanceLevel, imbalance, type BalanceLevel } from '@/utils/balance'
 import type { Valve } from '@/types/valve'
+import { ensureAdjustBaselines } from '@/utils/baseline'
 
 export interface AdjustEnriched {
   adjust: Adjust
   valve: Valve | null
-  /** 生成调节单时的失衡度快照（按最新实测重算） */
+  /** 展示用失衡度：优先取调节单冻结基线，读数再变也不影响建议依据 */
   imbalanceValue: number
   level: BalanceLevel
+  /** 展示用流量比，优先取冻结基线 */
+  ratio: number | null
+  /** 基线是否为旧单首次打开时补录 */
+  baselineBackfilled: boolean
 }
 
 export const useAdjustStore = defineStore('adjust', () => {
@@ -52,6 +57,20 @@ export const useAdjustStore = defineStore('adjust', () => {
   const enriched = computed<AdjustEnriched[]>(() =>
     adjusts.value.map((adjust) => {
       const valve = valveStore.valves.find((item) => item.id === adjust.valveId) ?? null
+      const baseline = adjust.baseline
+      // 已有冻结基线：依据永远取冻结的那一组数据；无基线（旧单补录前）才按最新实测重算
+      if (baseline && baseline.imbalanceValue !== null) {
+        const design = valve ? valve.designFlowM3h : 0
+        const measured = baseline.measuredFlowM3h ?? 0
+        return {
+          adjust,
+          valve,
+          imbalanceValue: baseline.imbalanceValue,
+          ratio: baseline.ratio,
+          baselineBackfilled: baseline.backfilled === true,
+          level: valve ? balanceLevel(baseline.imbalanceValue, measured, design) : '平衡'
+        }
+      }
       const snapshot = latestMeasureByValve.value[adjust.valveId]
       const design = valve ? valve.designFlowM3h : 0
       const measured = snapshot ? snapshot.flowM3h : 0
@@ -61,6 +80,8 @@ export const useAdjustStore = defineStore('adjust', () => {
         adjust,
         valve,
         imbalanceValue: value,
+        ratio: snapshot ? measured / design : null,
+        baselineBackfilled: false,
         level: valve && snapshot ? balanceLevel(value, measured, design) : '平衡'
       }
     })
@@ -103,7 +124,7 @@ export const useAdjustStore = defineStore('adjust', () => {
 
   const hasAdjust = (valveId: string): boolean => adjusts.value.some((adjust) => adjust.valveId === valveId)
 
-  async function createAdjust(draft: AdjustDraft): Promise<AdjustRow> {
+  async function createAdjust(draft: AdjustDraft, baseline?: Adjust['baseline']): Promise<AdjustRow> {
     return (await adjustTable.create(
       {
         valveId: draft.valveId,
@@ -111,7 +132,8 @@ export const useAdjustStore = defineStore('adjust', () => {
         basis: draft.basis.trim(),
         executor: draft.executor.trim() || '待指派',
         state: draft.state,
-        reviewNote: draft.reviewNote.trim()
+        reviewNote: draft.reviewNote.trim(),
+        ...(baseline ? { baseline } : {})
       },
       'aj'
     )) as AdjustRow
@@ -148,9 +170,18 @@ export const useAdjustStore = defineStore('adjust', () => {
     await adjustTable.update(id, { state: '已复核', reviewNote: note.trim() || '复核合格' })
   }
 
-  /** 由失衡度排行批量生成调节单 */
+  /** 由失衡度排行批量生成调节单（同时冻结依据基线） */
   async function generateFromRank(
-    rows: Array<{ valve: Valve; measured: number; roomTempC: number; imbalanceValue: number; level: BalanceLevel; suggestOpening: number; basisText: string }>
+    rows: Array<{
+      valve: Valve
+      measured: number
+      roomTempC: number
+      imbalanceValue: number
+      level: BalanceLevel
+      suggestOpening: number
+      basisText: string
+      baseline?: Adjust['baseline']
+    }>
   ): Promise<number> {
     const now = Date.now()
     const payload: AdjustRow[] = rows
@@ -164,11 +195,23 @@ export const useAdjustStore = defineStore('adjust', () => {
         executor: '待指派',
         state: '待下发' as AdjustState,
         reviewNote: '',
+        ...(row.baseline ? { baseline: row.baseline } : {}),
         createdAt: now,
         updatedAt: now
       }))
     if (payload.length > 0) await db.adjusts.bulkPut(payload)
     return payload.length
+  }
+
+  /**
+   * 旧调节单首次打开时补出依据基线：按当前阀门与最新实测补算并标记 backfilled，
+   * 原 basis 依据原文保留。返回补录条数。
+   */
+  async function backfillBaselines(
+    valves: Array<{ id: string; currentOpening: number; designFlowM3h: number }>,
+    measures: Array<{ valveId: string; date: string; flowM3h: number; roomTempC: number }>
+  ): Promise<number> {
+    return ensureAdjustBaselines(valves, measures)
   }
 
   return {
@@ -190,6 +233,7 @@ export const useAdjustStore = defineStore('adjust', () => {
     removeAdjust,
     advance,
     review,
-    generateFromRank
+    generateFromRank,
+    backfillBaselines
   }
 })

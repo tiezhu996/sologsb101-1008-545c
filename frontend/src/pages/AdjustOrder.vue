@@ -4,7 +4,7 @@
  * 生成目标开度、执行回填、复核确认并导出全量 JSON。
  * 消费 Adjust、Valve、Measure；复用 <FilterBar>、<EmptyPanel>、<StatBadge>、<BalanceTag>。
  */
-import { computed, reactive, ref, watchEffect } from 'vue'
+import { computed, reactive, ref, watch, watchEffect } from 'vue'
 import { MessagePlugin, DialogPlugin } from 'tdesign-vue-next'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
@@ -19,10 +19,12 @@ import {
   ADJUST_STATE_FLOW,
   EMPTY_ADJUST_DRAFT,
   type Adjust,
+  type AdjustBaseline,
   type AdjustDraft,
   type AdjustState
 } from '@/types/adjust'
 import { basisText, formatOpening } from '@/utils/balance'
+import { freezeBaseline } from '@/utils/baseline'
 import { exportAdjustCsv } from '@/utils/export'
 import {
   DB_VERSION,
@@ -54,6 +56,34 @@ watchEffect(() => {
     }))
   )
 })
+
+// 旧调节单首次打开时补出依据基线（原依据不动），实测/阀门订阅就绪后执行一次
+let baselineBackfilled = false
+watch(
+  () => rank.measureTable.ready.value,
+  (ready) => {
+    if (!ready || baselineBackfilled) return
+    baselineBackfilled = true
+    void adjustStore
+      .backfillBaselines(
+        valveStore.valves.map((valve) => ({
+          id: valve.id,
+          currentOpening: valve.currentOpening,
+          designFlowM3h: valve.designFlowM3h
+        })),
+        rank.measureTable.rows.value.map((measure) => ({
+          valveId: measure.valveId,
+          date: measure.date,
+          flowM3h: measure.flowM3h,
+          roomTempC: measure.roomTempC
+        }))
+      )
+      .then((count) => {
+        if (count > 0) MessagePlugin.info(`已为 ${count} 张旧调节单补出依据基线，原依据仍可查看`)
+      })
+  },
+  { immediate: true }
+)
 
 const counts = ref<Record<string, number>>({})
 const lastBackupAt = ref<string | null>(readLastBackupAt())
@@ -108,6 +138,10 @@ const dialogTitle = ref('调节单')
 const form = reactive<AdjustDraft>({ ...EMPTY_ADJUST_DRAFT })
 const formRef = ref()
 let editingId: string | null = null
+/** 编辑中的冻结基线（旧单首次打开时补录会带标记，原依据可查看） */
+const formBaseline = ref<AdjustBaseline | null>(null)
+/** 新建时冻结，提交随单保存 */
+let createBaseline: AdjustBaseline | null = null
 
 const rules = {
   valveId: [{ required: true, message: '请选择阀门', type: 'error' as const }],
@@ -131,10 +165,33 @@ function openCreate(): void {
     targetOpening: first ? first.suggestOpening : 50,
     basis: first ? describeRow(first.valve.id) : ''
   })
+  createBaseline = first ? freezeBaseline(first) : null
+  formBaseline.value = createBaseline
   dialogVisible.value = true
 }
 
-function openEdit(row: AdjustEnriched): void {
+/** 旧单首次打开时若缺基线则按当前数据补录（标记 backfilled，原依据保留） */
+async function ensureBaselineOnOpen(row: AdjustEnriched): Promise<AdjustBaseline | null> {
+  if (row.adjust.baseline) return row.adjust.baseline
+  const count = await adjustStore.backfillBaselines(
+    valveStore.valves.map((valve) => ({
+      id: valve.id,
+      currentOpening: valve.currentOpening,
+      designFlowM3h: valve.designFlowM3h
+    })),
+    rank.measureTable.rows.value.map((measure) => ({
+      valveId: measure.valveId,
+      date: measure.date,
+      flowM3h: measure.flowM3h,
+      roomTempC: measure.roomTempC
+    }))
+  )
+  if (count > 0) MessagePlugin.info('已为该旧调节单补出依据基线，原依据仍可查看')
+  const updated = adjustStore.adjusts.find((item) => item.id === row.adjust.id)
+  return updated?.baseline ?? null
+}
+
+async function openEdit(row: AdjustEnriched): Promise<void> {
   editingId = row.adjust.id
   dialogTitle.value = `编辑调节单 · ${row.valve ? row.valve.code : ''}`
   Object.assign(form, {
@@ -145,6 +202,8 @@ function openEdit(row: AdjustEnriched): void {
     state: row.adjust.state,
     reviewNote: row.adjust.reviewNote
   })
+  createBaseline = null
+  formBaseline.value = await ensureBaselineOnOpen(row)
   dialogVisible.value = true
 }
 
@@ -173,8 +232,8 @@ async function submit(): Promise<void> {
     await adjustStore.updateAdjust(editingId, { ...form })
     MessagePlugin.success('调节单已更新')
   } else {
-    await adjustStore.createAdjust({ ...form })
-    MessagePlugin.success('调节单已创建')
+    await adjustStore.createAdjust({ ...form }, createBaseline ?? undefined)
+    MessagePlugin.success('调节单已创建（依据已冻结）')
   }
   dialogVisible.value = false
   await refreshCounts()
@@ -397,10 +456,17 @@ function clearData(): void {
           <span v-else class="muted">—</span>
         </template>
         <template #openingCell="{ row }">
-          {{ row.valve ? formatOpening(row.valve.currentOpening) : '—' }} →
+          <span v-if="row.adjust.baseline" :title="`依据基线冻结于 ${new Date(row.adjust.baseline.frozenAt).toLocaleString()}`">
+            {{ formatOpening(row.adjust.baseline.opening) }}
+            <span class="muted">（冻）</span> →
+          </span>
+          <span v-else>— →</span>
           <strong>{{ formatOpening(row.adjust.targetOpening) }}</strong>
         </template>
         <template #basisCell="{ row }">
+          <t-tag v-if="row.adjust.baseline?.backfilled" size="small" theme="warning" style="margin-right: 4px">
+            基线补录
+          </t-tag>
           <span class="muted">{{ row.adjust.basis }}</span>
         </template>
         <template #stateCell="{ row }">
@@ -445,7 +511,9 @@ function clearData(): void {
         <t-descriptions-item label="阀门 / 实测">
           {{ counts.valves ?? 0 }} / {{ counts.measures ?? 0 }}
         </t-descriptions-item>
-        <t-descriptions-item label="调节单">{{ counts.adjusts ?? 0 }}</t-descriptions-item>
+        <t-descriptions-item label="调节单">
+          {{ counts.adjusts ?? 0 }}（调网方案 {{ counts.gridPlans ?? 0 }} 个）
+        </t-descriptions-item>
       </t-descriptions>
       <div class="toolbar" style="margin-top: 14px">
         <t-button theme="primary" variant="outline" @click="exportJson">导出全量 JSON</t-button>
@@ -464,7 +532,20 @@ function clearData(): void {
       :cancel-btn="'取消'"
       @confirm="submit"
     >
-      <t-form ref="formRef" :data="form" :rules="rules" label-width="128px">
+      <div v-if="formBaseline" class="baseline-box">
+        <div class="baseline-box__head">
+          <strong>依据基线（冻结）</strong>
+          <t-tag v-if="formBaseline.backfilled" size="small" theme="warning">旧单首次打开补录</t-tag>
+        </div>
+        <div class="muted">
+          台账开度 {{ formatOpening(formBaseline.opening) }} → 目标
+          {{ formatOpening(formBaseline.targetOpening) }}；最新实测
+          {{ formBaseline.measuredFlowM3h !== null ? `${formBaseline.measuredFlowM3h.toFixed(1)} m³/h（${formBaseline.measureDate}）` : '无' }}
+          ；流量比 {{ formBaseline.ratio !== null ? formBaseline.ratio.toFixed(2) : '—' }}；失衡度
+          {{ formBaseline.imbalanceValue !== null ? `${formBaseline.imbalanceValue.toFixed(1)}%` : '—' }}
+        </div>
+      </div>
+      <t-form ref="formRef" :data="form" :rules="rules" label-width="128px" style="margin-top: 12px">
         <t-form-item label="阀门" name="valveId">
           <t-select v-model="form.valveId" :options="valveOptions" filterable placeholder="选择阀门" />
         </t-form-item>
@@ -503,3 +584,20 @@ function clearData(): void {
     </t-dialog>
   </div>
 </template>
+
+<style scoped>
+.baseline-box {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #e8f1fb;
+  border: 1px solid #9bbde0;
+}
+
+.baseline-box__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  color: #234a75;
+}
+</style>
