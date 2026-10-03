@@ -8,15 +8,16 @@ import type { Station } from '@/types/station'
 import type { Building } from '@/types/building'
 import type { Valve } from '@/types/valve'
 import type { Measure } from '@/types/measure'
-import type { Adjust } from '@/types/adjust'
+import type { Adjust, AdjustPlan } from '@/types/adjust'
 
 export const DB_NAME = 'gbheatgrid'
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export const LS_KEYS = {
   dbVersion: 'gbheatgrid:db-version',
   lastBackupAt: 'gbheatgrid:last-backup-at',
-  uiPrefs: 'gbheatgrid:ui-prefs'
+  uiPrefs: 'gbheatgrid:ui-prefs',
+  planDraft: 'gbheatgrid:plan-exec-draft'
 } as const
 
 export interface UiPrefs {
@@ -35,19 +36,21 @@ export interface BackupPayload {
   valves: Valve[]
   measures: Measure[]
   adjusts: Adjust[]
+  adjustPlans: AdjustPlan[]
 }
 
 export interface Revisioned {
   revision?: number
 }
 
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 export type StationRow = Station & Revisioned
 export type BuildingRow = Building & Revisioned
 export type ValveRow = Valve & Revisioned
 export type MeasureRow = Measure & Revisioned
 export type AdjustRow = Adjust & Revisioned
+export type AdjustPlanRow = AdjustPlan & Revisioned
 
 class HeatGridDatabase extends Dexie {
   stations!: Table<StationRow, string>
@@ -55,6 +58,7 @@ class HeatGridDatabase extends Dexie {
   valves!: Table<ValveRow, string>
   measures!: Table<MeasureRow, string>
   adjusts!: Table<AdjustRow, string>
+  adjustPlans!: Table<AdjustPlanRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -84,7 +88,7 @@ class HeatGridDatabase extends Dexie {
           .table('valves')
           .toCollection()
           .modify((valve: Record<string, unknown>) => {
-            valve.revision = ROW_REVISION
+            valve.revision = 2
             if (typeof valve.stationId !== 'string' || valve.stationId.length === 0) {
               valve.stationId = stationOfBuilding.get(String(valve.buildingId)) ?? ''
             }
@@ -98,7 +102,7 @@ class HeatGridDatabase extends Dexie {
             .table(name)
             .toCollection()
             .modify((row: Record<string, unknown>) => {
-              row.revision = ROW_REVISION
+              row.revision = 2
             })
         }
 
@@ -110,6 +114,37 @@ class HeatGridDatabase extends Dexie {
             if (adjust.state !== '待下发' && adjust.state !== '已调节' && adjust.state !== '已复核') {
               adjust.state = '待下发'
             }
+          })
+      })
+
+    // v3：新增调网方案表；调节单补 planId 索引与基线/执行/冲突字段（旧单基线惰性补录）
+    this.version(DB_VERSION)
+      .stores({
+        stations: 'id, name, commissionYear, updatedAt',
+        buildings: 'id, stationId, name, heatMode, updatedAt',
+        valves: 'id, buildingId, stationId, code, position, updatedAt',
+        measures: 'id, valveId, date, operator, updatedAt',
+        adjusts: 'id, valveId, planId, state, executor, updatedAt',
+        adjustPlans: 'id, stationId, state, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        for (const name of ['stations', 'buildings', 'valves', 'measures', 'adjusts']) {
+          await tx
+            .table(name)
+            .toCollection()
+            .modify((row: Record<string, unknown>) => {
+              row.revision = ROW_REVISION
+            })
+        }
+        // 历史调节单：基线留空，首次打开方案/调节单时按当时读数补录，原依据不动
+        await tx
+          .table('adjusts')
+          .toCollection()
+          .modify((adjust: Record<string, unknown>) => {
+            if (!('baseline' in adjust)) adjust.baseline = null
+            if (!('execution' in adjust)) adjust.execution = null
+            if (!('openingConflict' in adjust)) adjust.openingConflict = null
+            if (typeof adjust.planId !== 'string') adjust.planId = null
           })
       })
   }
@@ -202,14 +237,14 @@ const SEED_MEASURES: MeasureRow[] = [
 ]
 
 const SEED_ADJUSTS: AdjustRow[] = [
-  { id: 'aj-1', valveId: 'vv-1', targetOpening: 55, basis: '3号楼 BL-3-01 失衡度 30.2%，流量比 0.58 明显偏小，需增大开度补流', executor: '王海', state: '已复核', reviewNote: '复核后流量比回升至 0.96，室温 20.4℃，合格', createdAt: stamp(-14), updatedAt: stamp(-6), revision: ROW_REVISION },
-  { id: 'aj-2', valveId: 'vv-5', targetOpening: 60, basis: '7号楼 BL-7-01 失衡度 23.5%，楼栋整体偏小，建议开度由 40% 调至 60%', executor: '赵明', state: '已调节', reviewNote: '', createdAt: stamp(-9), updatedAt: stamp(-4), revision: ROW_REVISION },
-  { id: 'aj-3', valveId: 'vv-9', targetOpening: 62, basis: 'B座 BL-B-01 失衡度 20.2%，流量比 0.74 偏小', executor: '孙倩', state: '待下发', reviewNote: '', createdAt: stamp(-3), updatedAt: stamp(-3), revision: ROW_REVISION },
-  { id: 'aj-4', valveId: 'vv-4', targetOpening: 50, basis: '5号楼 BL-5-02 失衡度 20.0%，流量比 1.23 偏大，需关小阀门', executor: '李强', state: '待下发', reviewNote: '', createdAt: stamp(-2), updatedAt: stamp(-2), revision: ROW_REVISION }
+  { id: 'aj-1', valveId: 'vv-1', targetOpening: 55, basis: '3号楼 BL-3-01 失衡度 30.2%，流量比 0.58 明显偏小，需增大开度补流', executor: '王海', state: '已复核', reviewNote: '复核后流量比回升至 0.96，室温 20.4℃，合格', baseline: null, execution: null, openingConflict: null, planId: null, createdAt: stamp(-14), updatedAt: stamp(-6), revision: ROW_REVISION },
+  { id: 'aj-2', valveId: 'vv-5', targetOpening: 60, basis: '7号楼 BL-7-01 失衡度 23.5%，楼栋整体偏小，建议开度由 40% 调至 60%', executor: '赵明', state: '已调节', reviewNote: '', baseline: null, execution: null, openingConflict: null, planId: null, createdAt: stamp(-9), updatedAt: stamp(-4), revision: ROW_REVISION },
+  { id: 'aj-3', valveId: 'vv-9', targetOpening: 62, basis: 'B座 BL-B-01 失衡度 20.2%，流量比 0.74 偏小', executor: '孙倩', state: '待下发', reviewNote: '', baseline: null, execution: null, openingConflict: null, planId: null, createdAt: stamp(-3), updatedAt: stamp(-3), revision: ROW_REVISION },
+  { id: 'aj-4', valveId: 'vv-4', targetOpening: 50, basis: '5号楼 BL-5-02 失衡度 20.0%，流量比 1.23 偏大，需关小阀门', executor: '李强', state: '待下发', reviewNote: '', baseline: null, execution: null, openingConflict: null, planId: null, createdAt: stamp(-2), updatedAt: stamp(-2), revision: ROW_REVISION }
 ]
 
 export async function seedDatabase(): Promise<void> {
-  await db.transaction('rw', db.stations, db.buildings, db.valves, db.measures, db.adjusts, async () => {
+  await db.transaction('rw', [db.stations, db.buildings, db.valves, db.measures, db.adjusts, db.adjustPlans], async () => {
     await db.stations.bulkPut(SEED_STATIONS)
     await db.buildings.bulkPut(SEED_BUILDINGS)
     await db.valves.bulkPut(SEED_VALVES)
@@ -229,10 +264,11 @@ export async function initDatabase(): Promise<void> {
 /* ============================== 级联删除 ============================== */
 
 export async function deleteStationCascade(stationId: string): Promise<void> {
-  await db.transaction('rw', db.stations, db.buildings, db.valves, db.measures, db.adjusts, async () => {
+  await db.transaction('rw', [db.stations, db.buildings, db.valves, db.measures, db.adjusts, db.adjustPlans], async () => {
     const buildings = await db.buildings.where('stationId').equals(stationId).toArray()
     await deleteValvesOfBuildings(buildings.map((item) => item.id))
     if (buildings.length > 0) await db.buildings.bulkDelete(buildings.map((item) => item.id))
+    await db.adjustPlans.where('stationId').equals(stationId).delete()
     await db.stations.delete(stationId)
   })
 }
@@ -266,23 +302,25 @@ async function deleteValvesOfBuildings(buildingIds: string[]): Promise<void> {
 /* ============================ 整库导入导出 ============================ */
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, buildings, valves, measures, adjusts] = await Promise.all([
+  const [stations, buildings, valves, measures, adjusts, adjustPlans] = await Promise.all([
     db.stations.count(),
     db.buildings.count(),
     db.valves.count(),
     db.measures.count(),
-    db.adjusts.count()
+    db.adjusts.count(),
+    db.adjustPlans.count()
   ])
-  return { stations, buildings, valves, measures, adjusts }
+  return { stations, buildings, valves, measures, adjusts, adjustPlans }
 }
 
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [stations, buildings, valves, measures, adjusts] = await Promise.all([
+  const [stations, buildings, valves, measures, adjusts, adjustPlans] = await Promise.all([
     db.stations.toArray(),
     db.buildings.toArray(),
     db.valves.toArray(),
     db.measures.toArray(),
-    db.adjusts.toArray()
+    db.adjusts.toArray(),
+    db.adjustPlans.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -296,36 +334,49 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     buildings: buildings.map(strip),
     valves: valves.map(strip),
     measures: measures.map(strip),
-    adjusts: adjusts.map(strip)
+    adjusts: adjusts.map(strip),
+    adjustPlans: adjustPlans.map(strip)
   }
 }
 
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
-  await db.transaction('rw', db.stations, db.buildings, db.valves, db.measures, db.adjusts, async () => {
+  await db.transaction('rw', [db.stations, db.buildings, db.valves, db.measures, db.adjusts, db.adjustPlans], async () => {
     await Promise.all([
       db.stations.clear(),
       db.buildings.clear(),
       db.valves.clear(),
       db.measures.clear(),
-      db.adjusts.clear()
+      db.adjusts.clear(),
+      db.adjustPlans.clear()
     ])
     const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
+    // 兼容旧版备份：调节单缺少方案相关字段时补空，旧基线缺失则首次打开惰性补录
+    const revAdjust = (row: Adjust): AdjustRow => ({
+      ...row,
+      baseline: 'baseline' in row ? row.baseline : null,
+      execution: 'execution' in row ? row.execution : null,
+      openingConflict: 'openingConflict' in row ? row.openingConflict : null,
+      planId: 'planId' in row ? row.planId : null,
+      revision: ROW_REVISION
+    })
     await db.stations.bulkPut((payload.stations ?? []).map(rev))
     await db.buildings.bulkPut((payload.buildings ?? []).map(rev))
     await db.valves.bulkPut((payload.valves ?? []).map(rev))
     await db.measures.bulkPut((payload.measures ?? []).map(rev))
-    await db.adjusts.bulkPut((payload.adjusts ?? []).map(rev))
+    await db.adjusts.bulkPut((payload.adjusts ?? []).map(revAdjust))
+    await db.adjustPlans.bulkPut((payload.adjustPlans ?? []).map(rev))
   })
 }
 
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', db.stations, db.buildings, db.valves, db.measures, db.adjusts, async () => {
+  await db.transaction('rw', [db.stations, db.buildings, db.valves, db.measures, db.adjusts, db.adjustPlans], async () => {
     await Promise.all([
       db.stations.clear(),
       db.buildings.clear(),
       db.valves.clear(),
       db.measures.clear(),
-      db.adjusts.clear()
+      db.adjusts.clear(),
+      db.adjustPlans.clear()
     ])
   })
 }
@@ -370,4 +421,48 @@ export function stampBackupTime(iso: string): void {
 
 export function readLastBackupAt(): string | null {
   return localStorage.getItem(LS_KEYS.lastBackupAt)
+}
+
+/* ====================== 调网方案执行草稿（保存失败恢复） ====================== */
+
+import type { PlanExecutionDraft } from '@/types/adjust'
+
+/** 读取全部未确认成功的执行草稿：key 为 `${planId}:${adjustId}` */
+export function readAllPlanDrafts(): PlanExecutionDraft[] {
+  try {
+    const raw = localStorage.getItem(LS_KEYS.planDraft)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? (parsed as PlanExecutionDraft[]) : []
+  } catch {
+    return []
+  }
+}
+
+export function readPlanDrafts(planId: string): PlanExecutionDraft[] {
+  return readAllPlanDrafts().filter((draft) => draft.planId === planId)
+}
+
+/** 保存失败时暂存一张单的执行回填草稿 */
+export function savePlanDraft(draft: PlanExecutionDraft): void {
+  const all = readAllPlanDrafts().filter(
+    (item) => !(item.planId === draft.planId && item.adjustId === draft.adjustId)
+  )
+  all.push(draft)
+  localStorage.setItem(LS_KEYS.planDraft, JSON.stringify(all))
+}
+
+/** 一张单确认成功后移除其草稿 */
+export function clearPlanDraft(planId: string, adjustId: string): void {
+  const rest = readAllPlanDrafts().filter(
+    (item) => !(item.planId === planId && item.adjustId === adjustId)
+  )
+  if (rest.length === 0) localStorage.removeItem(LS_KEYS.planDraft)
+  else localStorage.setItem(LS_KEYS.planDraft, JSON.stringify(rest))
+}
+
+export function clearPlanDrafts(planId: string): void {
+  const rest = readAllPlanDrafts().filter((item) => item.planId !== planId)
+  if (rest.length === 0) localStorage.removeItem(LS_KEYS.planDraft)
+  else localStorage.setItem(LS_KEYS.planDraft, JSON.stringify(rest))
 }

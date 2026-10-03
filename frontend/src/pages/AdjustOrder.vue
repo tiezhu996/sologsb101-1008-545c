@@ -4,13 +4,14 @@
  * 生成目标开度、执行回填、复核确认并导出全量 JSON。
  * 消费 Adjust、Valve、Measure；复用 <FilterBar>、<EmptyPanel>、<StatBadge>、<BalanceTag>。
  */
-import { computed, reactive, ref, watchEffect } from 'vue'
+import { computed, reactive, ref, watch, watchEffect } from 'vue'
 import { MessagePlugin, DialogPlugin } from 'tdesign-vue-next'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import BalanceTag from '@/components/common/BalanceTag.vue'
 import { useAdjustStore, type AdjustEnriched } from '@/stores/adjustStore'
+import { usePlanStore } from '@/stores/planStore'
 import { useValveStore } from '@/stores/valveStore'
 import { useStationStore } from '@/stores/stationStore'
 import { useImbalanceRank } from '@/hooks/useImbalanceRank'
@@ -18,11 +19,13 @@ import {
   ADJUST_STATES,
   ADJUST_STATE_FLOW,
   EMPTY_ADJUST_DRAFT,
+  isAdjustConfirmed,
   type Adjust,
   type AdjustDraft,
   type AdjustState
 } from '@/types/adjust'
 import { basisText, formatOpening } from '@/utils/balance'
+import { baselineFromRank } from '@/utils/baseline'
 import { exportAdjustCsv } from '@/utils/export'
 import {
   DB_VERSION,
@@ -40,6 +43,7 @@ import {
 type FilterModel = { keyword: string; [key: string]: string | string[] | boolean }
 
 const adjustStore = useAdjustStore()
+const planStore = usePlanStore()
 const valveStore = useValveStore()
 const stationStore = useStationStore()
 const rank = useImbalanceRank()
@@ -54,6 +58,29 @@ watchEffect(() => {
     }))
   )
 })
+
+// 旧调节单首次打开：缺基线的单按当前读数补出基线（只补空，已确认项不重算，原依据不动）。
+// ensureBaselines 幂等，每次数据变化重复执行也安全，无需一次性闩锁。
+watch(
+  () => [rank.rows.value.length, adjustStore.adjusts.length] as const,
+  ([rankCount]) => {
+    if (rankCount === 0) return
+    void (async () => {
+      const patch = adjustStore.adjusts
+        .filter((adjust) => !adjust.baseline && !isAdjustConfirmed(adjust))
+        .map((adjust) => {
+          const row = rank.rowOf(adjust.valveId)
+          return { adjustId: adjust.id, baseline: row ? baselineFromRank(row, Date.now(), true) : null }
+        })
+        .filter((item): item is { adjustId: string; baseline: NonNullable<typeof item.baseline> } => item.baseline !== null)
+      if (patch.length > 0) {
+        const count = await adjustStore.ensureBaselines(patch)
+        if (count > 0) MessagePlugin.info(`已为 ${count} 张旧调节单补出基线，原依据保留可查`)
+      }
+    })()
+  },
+  { immediate: true }
+)
 
 const counts = ref<Record<string, number>>({})
 const lastBackupAt = ref<string | null>(readLastBackupAt())
@@ -135,6 +162,14 @@ function openCreate(): void {
 }
 
 function openEdit(row: AdjustEnriched): void {
+  // 方案内未完成的单：目标开度已冻结，编辑走调网方案向导；未解决冲突也必须先确认
+  if (row.adjust.planId) {
+    const plan = planStore.planById(row.adjust.planId)
+    if (plan && plan.state !== '已完成') {
+      MessagePlugin.info('该单已纳入调网方案，目标开度已冻结，请到失衡度计算页的调网方案中执行回填')
+      return
+    }
+  }
   editingId = row.adjust.id
   dialogTitle.value = `编辑调节单 · ${row.valve ? row.valve.code : ''}`
   Object.assign(form, {
@@ -214,13 +249,25 @@ async function advance(row: AdjustEnriched): Promise<void> {
     MessagePlugin.info('该调节单已完成复核闭环')
     return
   }
+  if (row.adjust.openingConflict && !row.adjust.openingConflict.resolved) {
+    MessagePlugin.error('该单存在未确认的开度冲突：方案与台账两方开度均保留，请到失衡度计算页的调网方案中确认')
+    return
+  }
+  if (row.adjust.planId && next === '已调节' && !row.adjust.execution) {
+    MessagePlugin.warning('该单在调网方案内：请在方案向导中回填实际开度与新实测，勿直接回写台账')
+    return
+  }
   if (next === '已复核') {
     openReview(row)
     return
   }
-  await adjustStore.advance(row.adjust.id)
-  MessagePlugin.success(`已推进为「${next}」，目标开度已回写到阀门台账`)
-  await refreshCounts()
+  try {
+    await adjustStore.advance(row.adjust.id)
+    MessagePlugin.success(`已推进为「${next}」，目标开度已回写到阀门台账`)
+    await refreshCounts()
+  } catch (error) {
+    MessagePlugin.error(error instanceof Error ? error.message : '状态推进失败')
+  }
 }
 
 /* ------------------------------ 复核 ------------------------------ */
@@ -354,6 +401,7 @@ function clearData(): void {
       <StatBadge label="待下发" :value="adjustStore.stateCounts['待下发']" suffix="张" tone="warning" />
       <StatBadge label="已调节" :value="adjustStore.stateCounts['已调节']" suffix="张" tone="info" />
       <StatBadge label="已复核" :value="adjustStore.stateCounts['已复核']" suffix="张" tone="success" />
+      <StatBadge label="开度冲突待确认" :value="adjustStore.conflictCount" suffix="张" tone="danger" />
       <StatBadge label="复核率" :value="adjustStore.reviewedPercent" :percent="adjustStore.reviewedPercent" suffix="%" tone="primary" />
     </div>
 
@@ -397,8 +445,26 @@ function clearData(): void {
           <span v-else class="muted">—</span>
         </template>
         <template #openingCell="{ row }">
-          {{ row.valve ? formatOpening(row.valve.currentOpening) : '—' }} →
-          <strong>{{ formatOpening(row.adjust.targetOpening) }}</strong>
+          <div>
+            <span v-if="row.adjust.baseline">
+              基线 {{ formatOpening(row.adjust.baseline.currentOpening) }} →
+              <strong>{{ formatOpening(row.adjust.targetOpening) }}</strong>
+              <t-tag v-if="row.adjust.baseline.backfilled" size="small" theme="warning" variant="light">旧单补录</t-tag>
+            </span>
+            <span v-else>
+              {{ row.valve ? formatOpening(row.valve.currentOpening) : '—' }} →
+              <strong>{{ formatOpening(row.adjust.targetOpening) }}</strong>
+            </span>
+          </div>
+          <div v-if="row.adjust.execution" class="muted">
+            实际 {{ formatOpening(row.adjust.execution.actualOpening) }}
+          </div>
+          <div v-if="row.adjust.openingConflict && !row.adjust.openingConflict.resolved" style="margin-top: 2px">
+            <t-tag size="small" theme="danger" variant="light">
+              冲突：方案 {{ formatOpening(row.adjust.openingConflict.executionOpening) }} /
+              台账 {{ formatOpening(row.adjust.openingConflict.ledgerOpening) }}
+            </t-tag>
+          </div>
         </template>
         <template #basisCell="{ row }">
           <span class="muted">{{ row.adjust.basis }}</span>

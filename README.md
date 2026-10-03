@@ -54,12 +54,12 @@ sologsb101-1008/
     ├── public/favicon.svg
     └── src/
         ├── types/              # station.ts building.ts valve.ts measure.ts adjust.ts
-        ├── stores/             # stationStore.ts valveStore.ts adjustStore.ts
-        ├── components/common/  # BalanceTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
+        ├── stores/             # stationStore.ts valveStore.ts adjustStore.ts planStore.ts
+        ├── components/common/  # BalanceTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue PlanWizardDialog.vue
         ├── hooks/              # useImbalanceRank.ts useIdbTable.ts
         ├── pages/              # StationList.vue ValveList.vue MeasureEntry.vue BalanceBoard.vue AdjustOrder.vue
         ├── router/index.ts
-        ├── utils/              # balance.ts db.ts export.ts
+        ├── utils/              # balance.ts baseline.ts db.ts export.ts
         ├── styles/main.css
         ├── App.vue
         └── main.ts
@@ -72,16 +72,16 @@ sologsb101-1008/
 | `/stations` | 换热站与楼栋台账 | Station、Building | 新建/编辑/删除换热站与楼栋；按供热方式与面积区间筛选；卡片回显失衡楼栋数与待复核单数 |
 | `/valves` | 阀位与设计参数登记 | Valve、Building | 登记口径/位置/开度/设计流量；开度改动进入草稿后可逐条或批量提交；失衡标签与开度校核 |
 | `/measures` | 实测流量/供回水温录入 | Measure、Valve | 按日期成组录入流量与三温；支持「阀门编号,日期,流量,供温,回温,室温,录入人」批量粘贴导入并即时预览失衡度 |
-| `/balance` | 失衡度计算与排序 | Valve、Measure | 按失衡度降序排行；仅看失衡；导出失衡度 CSV；单条/一键生成调节单 |
+| `/balance` | 失衡度计算与排序 | Valve、Measure、Adjust、AdjustPlan | 按失衡度降序排行；仅看失衡；导出失衡度 CSV；单条/一键生成调节单；按换热站发起可中止的调网方案（冻结基线、逐张执行回填、开度冲突双方保留待确认、保存失败从最后确认的一张继续） |
 | `/adjusts` | 调节单下发与复核 | Adjust、Valve、Measure | 状态机 待下发→已调节（回写阀门开度）→已复核（记录复核意见）；导出调节单 CSV 与全量 JSON |
 
 ## 五、数据存储说明
 
 - **IndexedDB 库名**：`gbheatgrid`（Dexie 封装，`src/utils/db.ts`）
-- **对象表**：`stations`、`buildings`、`valves`、`measures`、`adjusts`
-- **数据结构版本**：`DB_VERSION = 2`，含 `version(1)` → `version(2)` 的索引变更与 `upgrade()` 迁移（补齐 `revision`、用所属楼栋回填阀门 `stationId` 冗余列、规整开度与复核字段）
+- **对象表**：`stations`、`buildings`、`valves`、`measures`、`adjusts`、`adjustPlans`
+- **数据结构版本**：`DB_VERSION = 3`，含 `version(1) → version(2) → version(3)` 的索引变更与 `upgrade()` 迁移（补齐 `revision`、用所属楼栋回填阀门 `stationId` 冗余列、规整开度与复核字段；v3 新增调网方案表并为调节单补基线/执行/开度冲突/方案字段，旧单基线首次打开时惰性补录）
 - **首屏自动播种**：`initDatabase()` 中 `if (await db.stations.count() === 0) await seedDatabase()`，播种 2 座换热站 → 5 栋楼 → 10 只阀门 → 20 条实测 → 4 张调节单的互相引用数据；播种幂等
-- **localStorage 辅助键**：`gbheatgrid:db-version`、`gbheatgrid:last-backup-at`、`gbheatgrid:ui-prefs`（上次选中换热站、仅看失衡开关）
+- **localStorage 辅助键**：`gbheatgrid:db-version`、`gbheatgrid:last-backup-at`、`gbheatgrid:ui-prefs`（上次选中换热站、仅看失衡开关）、`gbheatgrid:plan-exec-draft`（调网方案保存失败时的执行草稿，重新打开从最后确认的一张继续）
 - 应用为**无状态容器**：数据不落容器磁盘、不使用数据库服务、不挂载命名卷
 
 ## 六、本地开发

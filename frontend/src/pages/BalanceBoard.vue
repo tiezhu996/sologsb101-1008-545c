@@ -1,24 +1,30 @@
 <script setup lang="ts">
 /**
  * /balance 失衡度计算与排序
- * 按流量比、室温偏差合成失衡度并降序排列，可一键生成调节单。
- * 消费 Valve、Measure；复用 <BalanceTag>、<StatBadge>、<EmptyPanel>。
+ * 按流量比、室温偏差合成失衡度并降序排列，可一键生成调节单，
+ * 也可按换热站发起「可中止的调网方案」：选站冻结基线，逐张执行回填，
+ * 执行与阀门台账同开度冲突时两方来源保留待确认，保存失败可恢复。
+ * 消费 Valve、Measure、AdjustPlan；复用 <BalanceTag>、<StatBadge>、<EmptyPanel>。
  */
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watchEffect } from 'vue'
 import { useRouter } from 'vue-router'
 import { DialogPlugin, MessagePlugin } from 'tdesign-vue-next'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import BalanceTag from '@/components/common/BalanceTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
+import PlanWizardDialog from '@/components/common/PlanWizardDialog.vue'
 import { useImbalanceRank, type ImbalanceRow } from '@/hooks/useImbalanceRank'
 import { useValveStore } from '@/stores/valveStore'
 import { useStationStore } from '@/stores/stationStore'
 import { useAdjustStore } from '@/stores/adjustStore'
+import { usePlanStore } from '@/stores/planStore'
 import { IMBALANCE_BALANCED, IMBALANCE_WARN, basisText, formatFlow, formatOpening } from '@/utils/balance'
+import { baselineFromRank } from '@/utils/baseline'
 import { ADJUST_STATES, EMPTY_ADJUST_DRAFT, type AdjustDraft } from '@/types/adjust'
 import { exportBalanceCsv } from '@/utils/export'
 import { HEAT_MODES, type HeatMode } from '@/types/building'
+import type { AdjustPlanRow } from '@/utils/db'
 
 type FilterModel = { keyword: string; [key: string]: string | string[] | boolean }
 
@@ -27,6 +33,12 @@ const rank = useImbalanceRank()
 const valveStore = useValveStore()
 const stationStore = useStationStore()
 const adjustStore = useAdjustStore()
+const planStore = usePlanStore()
+
+// 把排行行灌入方案 store，发起方案/旧单补基线时据此冻结
+watchEffect(() => {
+  planStore.bindRankRows(rank.rows.value.map((row) => ({ rank: row })))
+})
 
 const filterModel = computed<FilterModel>(() => ({
   keyword: valveStore.filter.keyword,
@@ -94,14 +106,17 @@ async function generateOne(row: ImbalanceRow): Promise<void> {
     MessagePlugin.info(`${row.valve.code} 已存在调节单，请到调节单页处理`)
     return
   }
-  await adjustStore.createAdjust({
-    valveId: row.valve.id,
-    targetOpening: row.suggestOpening,
-    basis: describe(row),
-    executor: '待指派',
-    state: '待下发',
-    reviewNote: ''
-  })
+  await adjustStore.createAdjust(
+    {
+      valveId: row.valve.id,
+      targetOpening: row.suggestOpening,
+      basis: describe(row),
+      executor: '待指派',
+      state: '待下发',
+      reviewNote: ''
+    },
+    { baseline: baselineFromRank(row), planId: null }
+  )
   MessagePlugin.success(`已为 ${row.valve.code} 生成调节单，目标开度 ${row.suggestOpening}%`)
 }
 
@@ -115,6 +130,15 @@ function openAdjustEdit(row: ImbalanceRow): void {
   if (!adjust) {
     void generateOne(row)
     return
+  }
+  // 已纳入未完成方案的单：目标开度已冻结，统一在方案向导中执行/处理冲突
+  if (adjust.planId) {
+    const plan = planStore.planById(adjust.planId)
+    if (plan && plan.state !== '已完成') {
+      MessagePlugin.info('该单已纳入调网方案，目标开度已冻结，请在方案向导中执行回填')
+      openWizard(plan)
+      return
+    }
   }
   Object.assign(adjustForm, {
     valveId: adjust.valveId,
@@ -161,7 +185,8 @@ async function generateAll(): Promise<void> {
       imbalanceValue: row.imbalanceValue,
       level: row.level,
       suggestOpening: row.suggestOpening,
-      basisText: describe(row)
+      basisText: describe(row),
+      baseline: baselineFromRank(row)
     }))
   const count = await adjustStore.generateFromRank(payload)
   if (count === 0) {
@@ -195,6 +220,81 @@ function onOnlyImbalancedChange(value: unknown): void {
 function goAdjust(): void {
   void router.push('/adjusts')
 }
+
+/* --------------------------- 调网方案（可中止） --------------------------- */
+
+const planCreateVisible = ref(false)
+const planStationId = ref('')
+const wizardVisible = ref(false)
+const activePlan = ref<AdjustPlanRow | null>(null)
+
+/** 各换热站进行中/已中止的方案（用于「继续」入口） */
+const activePlanByStation = computed(() => {
+  const map = new Map<string, AdjustPlanRow>()
+  planStore.plans
+    .filter((plan) => plan.state === '进行中' || plan.state === '已中止')
+    .forEach((plan) => map.set(plan.stationId, plan))
+  return map
+})
+
+function stationPlanState(stationId: string): string {
+  return activePlanByStation.value.get(stationId)?.state ?? ''
+}
+
+function openPlanCreate(): void {
+  if (stationStore.stations.length === 0) {
+    MessagePlugin.warning('请先在换热站台账登记换热站')
+    return
+  }
+  const firstStation = stationStore.stations[0]
+  planStationId.value = valveStore.filter.stationId || firstStation.id
+  planCreateVisible.value = true
+}
+
+async function submitPlanCreate(): Promise<void> {
+  if (!planStationId.value) {
+    MessagePlugin.warning('请选择换热站')
+    return
+  }
+  const existing = planStore.planOfStation(planStationId.value)
+  if (existing) {
+    openWizard(existing)
+    planCreateVisible.value = false
+    return
+  }
+  try {
+    const plan = await planStore.createPlan(planStationId.value)
+    planCreateVisible.value = false
+    MessagePlugin.success(`已发起「${plan.stationName}」调网方案，基线已冻结`)
+    openWizard(plan)
+  } catch (error) {
+    MessagePlugin.error(error instanceof Error ? error.message : '发起方案失败')
+  }
+}
+
+function continueStationPlan(stationId: string): void {
+  const plan = activePlanByStation.value.get(stationId)
+  if (!plan) {
+    MessagePlugin.info('该换热站暂无进行中的方案')
+    return
+  }
+  openWizard(plan)
+}
+
+function openWizard(plan: AdjustPlanRow): void {
+  activePlan.value = plan
+  wizardVisible.value = true
+}
+
+function onPlanChanged(): void {
+  // 方案内写库后刷新当前活动方案引用（状态/进度）
+  if (activePlan.value) {
+    activePlan.value = planStore.planById(activePlan.value.id) ?? activePlan.value
+  }
+}
+
+const activePlanCount = computed(() => activePlanByStation.value.size)
+const anyUnresolvedConflict = computed(() => adjustStore.conflictCount > 0)
 </script>
 
 <template>
@@ -209,8 +309,40 @@ function goAdjust(): void {
       </div>
       <div class="page-head__actions">
         <t-button variant="outline" @click="exportCsv">导出失衡度 CSV</t-button>
+        <t-button variant="outline" @click="openPlanCreate">发起调网方案</t-button>
         <t-button variant="outline" @click="generateAll">一键生成调节单</t-button>
         <t-button theme="primary" @click="goAdjust">前往调节单（{{ adjustStore.stateCounts['待下发'] }}）</t-button>
+      </div>
+    </div>
+
+    <t-alert
+      v-if="anyUnresolvedConflict"
+      theme="error"
+      :message="`有 ${adjustStore.conflictCount} 张单的开度与阀门台账冲突待确认（两方来源均保留，未互相覆盖）`"
+      style="margin-bottom: 12px"
+    />
+
+    <div v-if="activePlanCount > 0" class="panel" style="margin-bottom: 16px">
+      <div class="panel-head">
+        <h3 class="panel-title" style="margin: 0">进行中的调网方案（{{ activePlanCount }}）</h3>
+        <span class="muted">基线已冻结，读数变化不影响方案建议依据；保存失败后可从最后确认的一张继续</span>
+      </div>
+      <div v-for="plan in planStore.plans.filter((item) => item.state === '进行中' || item.state === '已中止')" :key="plan.id" class="plan-row">
+        <div>
+          <strong>{{ plan.stationName }}</strong>
+          <t-tag size="small" :theme="plan.state === '进行中' ? 'primary' : 'warning'" variant="light" style="margin: 0 8px">
+            {{ plan.state }}
+          </t-tag>
+          <span class="muted">
+            已确认 {{ planStore.confirmedCountOfPlan(plan.id) }} /
+            {{ planStore.progressOfPlan(plan.id).total }} 张
+          </span>
+        </div>
+        <div class="toolbar">
+          <t-button size="small" theme="primary" variant="outline" @click="continueStationPlan(plan.stationId)">
+            {{ plan.state === '已中止' ? '继续方案' : '打开继续' }}
+          </t-button>
+        </div>
       </div>
     </div>
 
@@ -340,5 +472,50 @@ function goAdjust(): void {
         </t-form-item>
       </t-form>
     </t-dialog>
+
+    <!-- 发起调网方案：选站 -->
+    <t-dialog
+      v-model:visible="planCreateVisible"
+      header="发起调网方案（可中止）"
+      width="520px"
+      :confirm-btn="'冻结基线并发起'"
+      :cancel-btn="'取消'"
+      @confirm="submitPlanCreate"
+    >
+      <t-form label-width="96px">
+        <t-form-item label="换热站">
+          <t-select v-model="planStationId" filterable placeholder="选择换热站" style="width: 100%">
+            <t-option
+              v-for="station in stationStore.stations"
+              :key="station.id"
+              :value="station.id"
+              :label="`${station.name}（${stationPlanState(station.id) ? stationPlanState(station.id) + ' · 已有方案' : valveStore.valves.filter((v) => v.stationId === station.id).length + ' 只阀门'}）`"
+            />
+          </t-select>
+        </t-form-item>
+      </t-form>
+      <t-alert
+        theme="info"
+        message="发起后冻结该站每只阀门的当前开度、最新实测与目标开度作为基线；执行时回填实际开度与新实测。方案可随时中止，保存失败后重新打开从最后确认的一张继续。"
+      />
+    </t-dialog>
+
+    <!-- 方案执行向导 -->
+    <PlanWizardDialog v-model:visible="wizardVisible" :plan="activePlan" @changed="onPlanChanged" />
   </div>
 </template>
+
+<style scoped>
+.plan-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 4px;
+  border-top: 1px dashed var(--hg-line);
+}
+
+.plan-row:first-of-type {
+  border-top: none;
+}
+</style>
